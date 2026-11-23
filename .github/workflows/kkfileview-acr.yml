@@ -27,7 +27,8 @@ jobs:
             arch: arm64
             platform: linux/arm64
     env:
-      IMAGE: registry.cn-beijing.aliyuncs.com/mking/kkfileview:5.0.3-${{ matrix.arch }}
+      IMAGE: registry.cn-beijing.aliyuncs.com/mking/kkfileview
+      LOCAL_IMAGE: kkfileview-ci:5.0.3-${{ matrix.arch }}
 
     steps:
       - name: Check out fork at upstream v5.0.3 commit
@@ -68,11 +69,11 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build --builder default --platform '${{ matrix.platform }}' --load \
-            -f Dockerfile -t "$IMAGE" .
-          docker run --rm --platform '${{ matrix.platform }}' --entrypoint sh "$IMAGE" \
+            -f Dockerfile -t "$LOCAL_IMAGE" .
+          docker run --rm --platform '${{ matrix.platform }}' --entrypoint sh "$LOCAL_IMAGE" \
             -c 'java -version && libreoffice --version && test -f /opt/kkFileView-5.0.3/bin/kkFileView-5.0.3.jar'
 
-      - name: Push to ACR and inspect
+      - name: Push by digest to ACR
         shell: bash
         env:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
@@ -83,8 +84,22 @@ jobs:
           test -n "$ACR_PASSWORD"
           printf '%s' "$ACR_PASSWORD" | docker login registry.cn-beijing.aliyuncs.com \
             --username "$ACR_USERNAME" --password-stdin
-          docker push "$IMAGE"
-          docker buildx imagetools inspect "$IMAGE"
+          docker buildx build --builder default --platform '${{ matrix.platform }}' \
+            --output "type=image,name=$IMAGE,push=true,push-by-digest=true,name-canonical=true" \
+            --metadata-file image-metadata.json -f Dockerfile .
+          DIGEST="$(jq -r '."containerimage.digest" // empty' image-metadata.json)"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$DIGEST"
+          mkdir -p digests
+          printf '%s' "$DIGEST" > 'digests/${{ matrix.arch }}'
+
+      - name: Share digest with publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
 
   publish-multiarch:
     name: Publish multi-architecture tag
@@ -93,6 +108,13 @@ jobs:
     env:
       IMAGE: registry.cn-beijing.aliyuncs.com/mking/kkfileview
     steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
       - name: Combine platform images and verify manifest
         shell: bash
         env:
@@ -104,8 +126,12 @@ jobs:
           test -n "$ACR_PASSWORD"
           printf '%s' "$ACR_PASSWORD" | docker login registry.cn-beijing.aliyuncs.com \
             --username "$ACR_USERNAME" --password-stdin
+          DIGEST_AMD64="$(cat digests/amd64)"
+          DIGEST_ARM64="$(cat digests/arm64)"
+          [[ "$DIGEST_AMD64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$DIGEST_ARM64" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx imagetools create -t "$IMAGE:5.0.3" \
-            "$IMAGE:5.0.3-amd64" "$IMAGE:5.0.3-arm64"
+            "$IMAGE@$DIGEST_AMD64" "$IMAGE@$DIGEST_ARM64"
           docker buildx imagetools inspect "$IMAGE:5.0.3"
           docker buildx imagetools inspect --raw "$IMAGE:5.0.3" | \
             jq -e '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | unique | sort == ["amd64", "arm64"]'
