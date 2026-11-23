@@ -1,0 +1,87 @@
+# Copy this file to .github/workflows/kkfileview-acr.yml on the
+# build/kkfileview-acr branch of your fork of kekingcn/kkFileView.
+# Create and push a tag named acr-kkfileview-5.0.3-* at that branch's commit to build.
+# Configure repository secrets ACR_USERNAME and ACR_PASSWORD before tagging.
+name: Build kkFileView 5.0.3 for ACR
+
+on:
+  push:
+    tags:
+      - 'acr-kkfileview-5.0.3-*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+    env:
+      IMAGE: registry.cn-beijing.aliyuncs.com/mking/kkfileview:5.0.3-${{ matrix.arch }}
+
+    steps:
+      - name: Check out fork at upstream v5.0.3 commit
+        uses: actions/checkout@v7
+        with:
+          ref: 3b82689a676e8a7e7d3ec4cc0c74de0676b0dac9
+          persist-credentials: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Package upstream application
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          mvn -B -pl server -am -DskipTests package
+          test -f server/target/kkFileView-5.0.3.tar.gz
+
+      - name: Build base locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --builder default --platform '${{ matrix.platform }}' --load \
+            -f docker/kkfileview-base/Dockerfile \
+            -t keking/kkfileview-base:5.0.0 docker/kkfileview-base
+          docker image inspect keking/kkfileview-base:5.0.0 \
+            --format '{{.Os}}/{{.Architecture}} {{.Id}}'
+          test "$(docker image inspect keking/kkfileview-base:5.0.0 \
+            --format '{{.Architecture}}')" = '${{ matrix.arch }}'
+
+      - name: Build application from upstream Dockerfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --builder default --platform '${{ matrix.platform }}' --load \
+            -f Dockerfile -t "$IMAGE" .
+          docker run --rm --platform '${{ matrix.platform }}' --entrypoint sh "$IMAGE" \
+            -c 'java -version && libreoffice --version && test -f /opt/kkFileView-5.0.3/bin/kkFileView-5.0.3.jar'
+
+      - name: Push to ACR and inspect
+        shell: bash
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ACR_USERNAME"
+          test -n "$ACR_PASSWORD"
+          printf '%s' "$ACR_PASSWORD" | docker login registry.cn-beijing.aliyuncs.com \
+            --username "$ACR_USERNAME" --password-stdin
+          docker push "$IMAGE"
+          docker buildx imagetools inspect "$IMAGE"
