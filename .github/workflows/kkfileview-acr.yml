@@ -28,7 +28,6 @@ jobs:
             platform: linux/arm64
     env:
       IMAGE: registry.cn-beijing.aliyuncs.com/mking/kkfileview
-      LOCAL_IMAGE: kkfileview-ci:5.0.3-${{ matrix.arch }}
 
     steps:
       - name: Check out fork at upstream v5.0.3 commit
@@ -52,26 +51,29 @@ jobs:
           mvn -B -pl server -am -DskipTests package
           test -f server/target/kkFileView-5.0.3.tar.gz
 
-      - name: Build base locally
+      - name: Compose pinned base and application Dockerfiles
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --builder default --platform '${{ matrix.platform }}' --load \
-            -f docker/kkfileview-base/Dockerfile \
-            -t keking/kkfileview-base:5.0.0 docker/kkfileview-base
-          docker image inspect keking/kkfileview-base:5.0.0 \
-            --format '{{.Os}}/{{.Architecture}} {{.Id}}'
-          test "$(docker image inspect keking/kkfileview-base:5.0.0 \
-            --format '{{.Architecture}}')" = '${{ matrix.arch }}'
+          python3 - <<'PY'
+          from pathlib import Path
+          base = Path('docker/kkfileview-base/Dockerfile').read_text()
+          app = Path('Dockerfile').read_text()
+          assert base.count('FROM ubuntu:24.04') == 1
+          assert base.count('ADD fonts/*') == 1
+          assert app.count('FROM keking/kkfileview-base:5.0.0') == 1
+          base = base.replace('FROM ubuntu:24.04', 'FROM ubuntu:24.04 AS kkfileview-base', 1)
+          base = base.replace('ADD fonts/*', 'ADD docker/kkfileview-base/fonts/*', 1)
+          app = app.replace('FROM keking/kkfileview-base:5.0.0', 'FROM kkfileview-base', 1)
+          Path('Dockerfile.acr.generated').write_text(base + '\n' + app)
+          PY
 
-      - name: Build application from upstream Dockerfile
+      - name: Set up Docker container builder
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --builder default --platform '${{ matrix.platform }}' --load \
-            -f Dockerfile -t "$LOCAL_IMAGE" .
-          docker run --rm --platform '${{ matrix.platform }}' --entrypoint sh "$LOCAL_IMAGE" \
-            -c 'java -version && libreoffice --version && test -f /opt/kkFileView-5.0.3/bin/kkFileView-5.0.3.jar'
+          docker buildx create --driver docker-container --name kkfileview-acr --use
+          docker buildx inspect --bootstrap
 
       - name: Push by digest to ACR
         shell: bash
@@ -84,12 +86,15 @@ jobs:
           test -n "$ACR_PASSWORD"
           printf '%s' "$ACR_PASSWORD" | docker login registry.cn-beijing.aliyuncs.com \
             --username "$ACR_USERNAME" --password-stdin
-          docker buildx build --builder default --platform '${{ matrix.platform }}' \
+          docker buildx build --builder kkfileview-acr --platform '${{ matrix.platform }}' \
             --output "type=image,name=$IMAGE,push=true,push-by-digest=true,name-canonical=true" \
-            --metadata-file image-metadata.json -f Dockerfile .
+            --provenance=false --metadata-file image-metadata.json -f Dockerfile.acr.generated .
           DIGEST="$(jq -r '."containerimage.digest" // empty' image-metadata.json)"
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx imagetools inspect "$IMAGE@$DIGEST"
+          docker pull --platform '${{ matrix.platform }}' "$IMAGE@$DIGEST"
+          docker run --rm --platform '${{ matrix.platform }}' --entrypoint sh "$IMAGE@$DIGEST" \
+            -c 'java -version && libreoffice --version && test -f /opt/kkFileView-5.0.3/bin/kkFileView-5.0.3.jar'
           mkdir -p digests
           printf '%s' "$DIGEST" > 'digests/${{ matrix.arch }}'
 
