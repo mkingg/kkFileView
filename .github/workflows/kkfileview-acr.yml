@@ -85,3 +85,27 @@ jobs:
             --username "$ACR_USERNAME" --password-stdin
           docker push "$IMAGE"
           docker buildx imagetools inspect "$IMAGE"
+
+  publish-multiarch:
+    name: Publish multi-architecture tag
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: registry.cn-beijing.aliyuncs.com/mking/kkfileview
+    steps:
+      - name: Combine platform images and verify manifest
+        shell: bash
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ACR_USERNAME"
+          test -n "$ACR_PASSWORD"
+          printf '%s' "$ACR_PASSWORD" | docker login registry.cn-beijing.aliyuncs.com \
+            --username "$ACR_USERNAME" --password-stdin
+          docker buildx imagetools create -t "$IMAGE:5.0.3" \
+            "$IMAGE:5.0.3-amd64" "$IMAGE:5.0.3-arm64"
+          docker buildx imagetools inspect "$IMAGE:5.0.3"
+          docker buildx imagetools inspect --raw "$IMAGE:5.0.3" | \
+            jq -e '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | unique | sort == ["amd64", "arm64"]'
